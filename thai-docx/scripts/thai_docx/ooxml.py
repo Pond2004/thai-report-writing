@@ -1,0 +1,131 @@
+# SPDX-FileCopyrightText: 2026 Sayam Sriphua
+# SPDX-License-Identifier: MIT
+"""What the checker and the builder both know about WordprocessingML.
+
+The data lives once, in `assets/ooxml.json`, and the JavaScript implementation
+embeds the same file (ADR 0008). Element orders are the schema's, in ECMA-376 5th edition
+(2016), Part 1 (CT_RPr / CT_PPr / CT_Settings / CT_SectPr / CT_TblPr / CT_TrPr / CT_TcPr /
+CT_Lvl / CT_Style): a file out of a sequence the schema fixes is not a valid file, so order is
+checked, not assumed. A list inside an order is one place: the schema lets those names come in
+any order among themselves. A run's properties are such a list, with only w:rPrChange after
+them: the first edition (2006) fixed their sequence, the fifth made them a choice, and Word 365
+for Windows reads them in any order and uses every one.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+
+_DATA = json.loads(
+    (pathlib.Path(__file__).resolve().parent.parent.parent / "assets" / "ooxml.json").read_text(encoding="utf-8")
+)
+
+W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+RPR_ORDER: list = _DATA["rpr_order"]
+# The same names, one after another: the order Word writes them back in, and where a repair puts
+# one it adds, so a file it did not reorder keeps the bytes it always had
+RPR_NAMES: list[str] = [*RPR_ORDER[0], *RPR_ORDER[1:]]
+PPR_ORDER: list[str] = _DATA["ppr_order"]
+SETTINGS_ORDER: list[str] = _DATA["settings_order"]
+SECTPR_ORDER: list = _DATA["sectpr_order"]
+TBLPR_ORDER: list = _DATA["tblpr_order"]
+TRPR_ORDER: list = _DATA["trpr_order"]
+TCPR_ORDER: list = _DATA["tcpr_order"]
+LVL_ORDER: list = _DATA["lvl_order"]
+STYLE_ORDER: list = _DATA["style_order"]
+# Invisible characters the builder never adds and the checker always reports, by name; and
+# every other format character (Unicode category Cf) with them — the soft hyphen, the marks and
+# overrides of direction, the tag characters — from one list both implementations read, so
+# neither asks its own runtime's Unicode tables, which differ in version (ADR 0008).
+INVISIBLE: dict[str, str] = _DATA["invisible"]
+# Punctuation that belongs to the letters around it (writer.script_runs): one list both
+# implementations read, so neither asks its runtime what punctuation is
+PUNCTUATION = frozenset(_DATA["punctuation"])
+FORMAT = frozenset(chr(cp) for first, last in _DATA["format"] for cp in range(first, last + 1))
+
+
+def noncharacter(cp: int) -> bool:
+    """U+FDD0 to U+FDEF, and the last two code points of every plane."""
+    return 0xFDD0 <= cp <= 0xFDEF or cp & 0xFFFE == 0xFFFE
+
+
+def unseen(ch: str) -> str | None:
+    """How a character a reader cannot see is named in a message, or None."""
+    if ch in INVISIBLE:
+        return INVISIBLE[ch]
+    if ch in FORMAT:
+        return "U+%04X, a format character" % ord(ch)
+    if noncharacter(ord(ch)):
+        return "U+%04X, a noncharacter" % ord(ch)
+    return None
+
+
+# Fonts known to carry Thai glyphs, lower-cased. A font outside this list is a
+# warning, never a failure (ADR 0029): the list is what the maintainer knows.
+THAI_FONTS = frozenset(_DATA["thai_fonts"])
+
+
+def w(tag: str) -> str:
+    return "{%s}%s" % (W, tag)
+
+
+def local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def rank(order: list) -> dict[str, int]:
+    """Each name's place in an order; the names of a list inside it share one."""
+    return {name: i for i, entry in enumerate(order) for name in ([entry] if isinstance(entry, str) else entry)}
+
+
+# ST_OnOff: an element that switches a property says "off" by one of these values, and "on" by
+# any other or by none. Read as present-means-on, `<w:cs w:val="0"/>` passed as marked.
+OFF = frozenset(("0", "false", "off"))
+
+
+def is_on(el) -> bool:
+    return el.get(w("val")) not in OFF
+
+
+# The Thai marks that sit above or below a letter, and the four tone marks among them: a column is
+# measured without them (writer), and a line where one stands alone is named (markdown)
+THAI_MARKS = frozenset([0x0E31, *range(0x0E34, 0x0E3B), *range(0x0E47, 0x0E4F)])
+THAI_TONES = frozenset(range(0x0E48, 0x0E4C))
+
+
+# The scripts Word writes from a run's complex-script font and size: Thai, and the others of the
+# Middle East and of South and South-East Asia (B-09). Ranges of code points, one list both
+# implementations read.
+COMPLEX_SCRIPT: tuple[tuple[int, int], ...] = tuple((a, b) for a, b in _DATA["complex_script"])
+
+
+def is_complex(ch: str) -> bool:
+    """A character of a complex script: the run holding it is marked `<w:cs/>` (ADR 0039)."""
+    cp = ord(ch)
+    return any(a <= cp <= b for a, b in COMPLEX_SCRIPT)
+
+
+def is_thai(ch: str) -> bool:
+    return "฀" <= ch <= "๿"
+
+
+# U+200C and U+200D are how Persian, Devanagari and the other complex scripts spell: a word
+# written with one needs it. Thai spells with neither (the review of 0.3.0, B-D1).
+JOINERS = "\u200c\u200d"
+
+
+def joins(text: str, i: int) -> bool:
+    """`text[i]` is a joiner between two letters of a complex script other than Thai, so it is
+    text, not an invisible character to refuse or report (ADR 0023, Later)."""
+    return (text[i] in JOINERS and 0 < i < len(text) - 1
+            and all(is_complex(c) and not is_thai(c) for c in (text[i - 1], text[i + 1])))
+
+
+def unseen_in(text: str) -> str | None:
+    """How the first invisible character in `text` is named — the five by name first, then any
+    other in text order — or None. A joiner that joins (`joins`) is not one."""
+    text = "".join(ch for i, ch in enumerate(text) if not joins(text, i))
+    named = next((label for ch, label in INVISIBLE.items() if ch in text), None)
+    return named if named is not None else next((n for n in map(unseen, text) if n is not None), None)

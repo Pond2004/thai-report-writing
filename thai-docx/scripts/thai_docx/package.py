@@ -1,0 +1,316 @@
+# SPDX-FileCopyrightText: 2026 Sayam Sriphua
+# SPDX-License-Identifier: MIT
+"""The .docx container: writing stored entries (a build), writing a package again with its
+rewritten parts deflated by `deflate` (a repair), and reading entries by the rules
+ADR 0017 numbers — the same rules js/10-zip.js follows, so a damaged package gets
+the same verdict from both implementations and from every Python release.
+"""
+
+from __future__ import annotations
+
+import errno
+import os
+import stat
+import zlib
+
+from .deflate import deflate
+from typing import NamedTuple
+
+_OS_ERRORS = {
+    errno.ENOENT: "No such file or directory",
+    errno.EACCES: "Permission denied",
+    errno.EISDIR: "Is a directory",
+    errno.ENOTDIR: "Not a directory",
+    errno.EEXIST: "File exists",
+    errno.ENOSPC: "No space left on device",
+    errno.EFBIG: "File too large",
+    getattr(errno, "EDQUOT", -1): "Disk quota exceeded",
+}
+
+
+def os_error(exc: OSError, otherwise: str = "cannot be read") -> str:
+    """The reason a path could not be read — or, told so, written — in the same words in both
+    implementations."""
+    if isinstance(exc, NotRegularFile):
+        return "not a regular file"
+    return _OS_ERRORS.get(exc.errno, otherwise)
+
+
+def write_whole(path: str, data: bytes) -> None:
+    """The whole file or none of it, and only at `path`. The bytes go to `PATH.partial`, made
+    new — a `.partial` already there, or a link planted under that name, is removed first and
+    never written through — and then take the path's place, so a write cut short leaves the
+    file that was there as it was, and a link at the path is replaced, not followed. A path
+    that is a directory, a FIFO, a device or a socket is refused before anything is opened: a
+    FIFO would hold the command until something read it (the review of 0.3.0: D-02, F-02,
+    F-03, D-14). A new file is readable by its owner alone; a file replaced keeps the
+    permissions it had."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and stat.S_ISDIR(mode):
+        raise IsADirectoryError(errno.EISDIR, "Is a directory", path)
+    if mode is not None and not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+        raise NotRegularFile(path)
+    partial = path + ".partial"
+    try:
+        os.unlink(partial)
+    except OSError:
+        pass  # none there; or one that cannot be removed, which the exclusive open below refuses
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(partial, flags, 0o600)  # the user's alone, until it takes a file's place
+    try:
+        if mode is not None and stat.S_ISREG(mode) and hasattr(os, "fchmod"):
+            os.fchmod(fd, stat.S_IMODE(mode))  # a file replaced keeps the permissions it had
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(partial, path)
+    except BaseException:
+        try:
+            os.unlink(partial)
+        except OSError:
+            pass
+        raise
+
+
+class NotRegularFile(OSError):
+    """A path that names a FIFO, a device or a socket: opening one can wait forever, and
+    reading one has no end."""
+
+
+def read_regular(path: str, cap: int) -> bytes:
+    """At most `cap + 1` bytes of a regular file, so a caller sees that it is over the cap
+    without asking the size first. The file is opened without waiting — a FIFO would otherwise
+    wait for a writer — and what was opened is what is judged, so nothing can change between
+    the look and the read. A directory is refused as the OS would name it; anything else that
+    is not a regular file is refused before a byte is read."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    with os.fdopen(fd, "rb"):  # closes the descriptor however this ends
+        mode = os.fstat(fd).st_mode
+        if stat.S_ISDIR(mode):
+            raise IsADirectoryError(errno.EISDIR, "Is a directory", path)
+        if not stat.S_ISREG(mode):
+            raise NotRegularFile(path)
+        # in pieces, to the cap or the end: one read the size of the cap is refused by some files
+        # (a /proc one answers ENOMEM), and the size a file reports is not what it holds — /proc
+        # reports 0 (the review of 0.3.0, D-17)
+        chunks, got = [], 0
+        while got <= cap:
+            chunk = os.read(fd, min(65536, cap + 1 - got))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+        return b"".join(chunks)
+
+
+def same_file(a: str, b: str) -> bool:
+    """Do two paths name one file — the same path, a symbolic link to it, or a hard link?
+    A path that does not exist names no file yet."""
+    try:
+        one, two = os.stat(a), os.stat(b)
+    except (OSError, ValueError):
+        return False
+    return (one.st_dev, one.st_ino) == (two.st_dev, two.st_ino)
+
+
+MAX_FILE = 64 * 1024 * 1024
+LIMIT_64 = 1 << 53
+DOS_DATE = 33  # 1980-01-01
+SIG_LOCAL, SIG_CENTRAL, SIG_END, SIG_END64, SIG_LOCATOR = 0x04034B50, 0x02014B50, 0x06054B50, 0x06064B50, 0x07064B50
+
+
+class PackageError(Exception):
+    pass
+
+
+class Entry(NamedTuple):
+    name: str
+    name_bytes: bytes
+    flags: int
+    method: int
+    crc: int
+    compress_size: int
+    file_size: int
+    header_offset: int
+    mod: int = DOS_DATE << 16  # the DOS time and date as the central record holds them
+    made_by: int = 20         # "version made by": which system wrote the entry
+    attrs: int = 0o600 << 16  # the external attributes the central record carries
+
+
+def _u16(n: int) -> bytes:
+    return n.to_bytes(2, "little")
+
+
+def _u32(n: int) -> bytes:
+    return n.to_bytes(4, "little")
+
+
+def pack(parts: list[tuple[str, bytes]]) -> bytes:
+    """Stored entries in the order given, fixed date, no extra fields (ADR 0017)."""
+    out, central, offset = bytearray(), bytearray(), 0
+    for name, data in parts:
+        name_bytes = name.encode("utf-8")
+        flags = 0 if name.isascii() else 0x800
+        crc = zlib.crc32(data)
+        fields = _u16(flags) + _u16(0) + _u16(0) + _u16(DOS_DATE) + _u32(crc) + _u32(len(data)) + _u32(len(data)) + _u16(len(name_bytes)) + _u16(0)
+        local = _u32(SIG_LOCAL) + _u16(20) + fields
+        out += local + name_bytes + data
+        central += _u32(SIG_CENTRAL) + _u16(20) + _u16(20) + fields + _u16(0) + _u16(0) + _u16(0) + _u32(0o600 << 16) + _u32(offset) + name_bytes
+        offset += len(local) + len(name_bytes) + len(data)
+    end = _u32(SIG_END) + _u16(0) + _u16(0) + _u16(len(parts)) + _u16(len(parts)) + _u32(len(central)) + _u32(offset) + _u16(0)
+    return bytes(out + central + end)
+
+
+def raw(b: bytes, e: Entry) -> bytes:
+    """One entry's bytes **as the package holds them** — still compressed, if it is."""
+    h = e.header_offset
+    if _rd(b, h, 4) != SIG_LOCAL:
+        raise PackageError("bad local header")
+    name_len, extra_len = _rd(b, h + 26, 2), _rd(b, h + 28, 2)
+    start = h + 30 + name_len + extra_len
+    if start + e.compress_size > len(b):
+        raise PackageError("entry runs past the end")
+    return b[start : start + e.compress_size]
+
+
+def repack(b: bytes, ents: list[Entry], replace: dict[str, bytes]) -> bytes:
+    """The package again, in the order it had: an entry named in `replace` is written anew,
+    every other entry keeps the bytes it already had — its method, its checksum, its sizes and
+    its date (ADR 0037).
+
+    A rewritten entry is compressed by `deflate`, this project's own, which both
+    implementations run to the same bytes by construction (ADR 0008); it is stored when
+    compressing it would make it larger, as it would for an image that is already compressed.
+    """
+    unknown = [name for name in replace if name not in {e.name for e in ents}]
+    if unknown:
+        # a name that is not in the package would leave the file unchanged, quietly
+        raise PackageError("the package has no entry named '" + unknown[0] + "'")
+    out, central, offset = bytearray(), bytearray(), 0
+    for e in ents:
+        if e.name in replace:
+            data = replace[e.name]
+            packed = deflate(data)
+            smaller = len(packed) < len(data)
+            flags, method, crc = e.flags & 0x800, (8 if smaller else 0), zlib.crc32(data)
+            payload = packed if smaller else data
+            sizes = (len(payload), len(data))
+        else:
+            flags, method, crc = e.flags & 0x800, e.method, e.crc
+            payload, sizes = raw(b, e), (e.compress_size, e.file_size)
+        # _u32(mod) is the entry's DOS time and date, in the two places pack() writes them
+        fields = (_u16(flags) + _u16(method) + _u32(e.mod) + _u32(crc)
+                  + _u32(sizes[0]) + _u32(sizes[1]) + _u16(len(e.name_bytes)) + _u16(0))
+        local = _u32(SIG_LOCAL) + _u16(20) + fields
+        out += local + e.name_bytes + payload
+        central += _u32(SIG_CENTRAL) + _u16(e.made_by) + _u16(20) + fields + _u16(0) + _u16(0) + _u16(0) + _u32(e.attrs) + _u32(offset) + e.name_bytes
+        offset += len(local) + len(e.name_bytes) + len(payload)
+    end = _u32(SIG_END) + _u16(0) + _u16(0) + _u16(len(ents)) + _u16(len(ents)) + _u32(len(central)) + _u32(offset) + _u16(0)
+    return bytes(out + central + end)
+
+
+def _rd(b: bytes, o: int, n: int) -> int:
+    if o < 0 or o + n > len(b):
+        raise PackageError("read past the end")
+    value = int.from_bytes(b[o : o + n], "little")
+    if n == 8 and value >= LIMIT_64:
+        raise PackageError("64-bit value too large")
+    return value
+
+
+def entries(b: bytes) -> list[Entry]:
+    """The central directory (rules 2–5)."""
+    size = len(b)
+    if size < 22:
+        raise PackageError("too short")
+    end = -1
+    if _rd(b, size - 22, 4) == SIG_END and _rd(b, size - 2, 2) == 0:
+        end = size - 22
+    else:
+        for i in range(size - 22, max(0, size - 22 - 65535) - 1, -1):
+            if b[i : i + 4] == b"PK\x05\x06" and i + 22 + _rd(b, i + 20, 2) == size:
+                end = i
+                break
+    if end < 0:
+        raise PackageError("no end record")
+    count, cd_size, cd_offset, record = _rd(b, end + 10, 2), _rd(b, end + 12, 4), _rd(b, end + 16, 4), end
+    if end >= 20 and _rd(b, end - 20, 4) == SIG_LOCATOR:
+        record = end - 20 - 56
+        if record < 0 or _rd(b, record, 4) != SIG_END64:
+            raise PackageError("no zip64 end record")
+        count, cd_size, cd_offset = _rd(b, record + 32, 8), _rd(b, record + 40, 8), _rd(b, record + 48, 8)
+    concat = record - cd_size - cd_offset
+    if concat < 0:
+        raise PackageError("central directory overlaps its end record")
+    found: list[Entry] = []
+    p = cd_offset + concat
+    while p < record:
+        if p + 46 > record or _rd(b, p, 4) != SIG_CENTRAL:
+            raise PackageError("bad central directory record")
+        flags, method, crc = _rd(b, p + 8, 2), _rd(b, p + 10, 2), _rd(b, p + 16, 4)
+        mod, made_by, attrs = _rd(b, p + 12, 4), _rd(b, p + 4, 2), _rd(b, p + 38, 4)
+        compress_size, file_size = _rd(b, p + 20, 4), _rd(b, p + 24, 4)
+        name_len, extra_len, comment_len = _rd(b, p + 28, 2), _rd(b, p + 30, 2), _rd(b, p + 32, 2)
+        header_offset = _rd(b, p + 42, 4)
+        # a record that runs past the directory is refused below, where p passes record
+        x, extra_end = p + 46 + name_len, p + 46 + name_len + extra_len
+        name_bytes = b[p + 46 : x]
+        try:
+            name = name_bytes.decode("utf-8") if flags & 0x800 else name_bytes.decode("cp437")
+        except UnicodeDecodeError:
+            raise PackageError("name is not UTF-8") from None
+        while x + 4 <= extra_end:
+            field_id, field_len = _rd(b, x, 2), _rd(b, x + 2, 2)
+            if x + 4 + field_len > extra_end:
+                raise PackageError("extra field runs past its entry")
+            if field_id == 1:
+                q = x + 4
+                if file_size == 0xFFFFFFFF:
+                    if q + 8 > x + 4 + field_len:
+                        raise PackageError("zip64 field too short")
+                    file_size, q = _rd(b, q, 8), q + 8
+                if compress_size == 0xFFFFFFFF:
+                    if q + 8 > x + 4 + field_len:
+                        raise PackageError("zip64 field too short")
+                    compress_size, q = _rd(b, q, 8), q + 8
+                if header_offset == 0xFFFFFFFF:
+                    if q + 8 > x + 4 + field_len:
+                        raise PackageError("zip64 field too short")
+                    header_offset, q = _rd(b, q, 8), q + 8
+            x += 4 + field_len
+        found.append(Entry(name, name_bytes, flags, method, crc, compress_size, file_size, header_offset + concat, mod, made_by, attrs))
+        p = extra_end + comment_len
+    if p != record or len(found) != count:
+        raise PackageError("central directory does not add up")
+    return found
+
+
+def read(b: bytes, e: Entry) -> bytes:
+    """One entry's bytes (rules 8–10)."""
+    h = e.header_offset
+    if _rd(b, h, 4) != SIG_LOCAL:
+        raise PackageError("bad local header")
+    name_len, extra_len = _rd(b, h + 26, 2), _rd(b, h + 28, 2)
+    start = h + 30 + name_len + extra_len
+    if start > len(b) or b[h + 30 : h + 30 + name_len] != e.name_bytes:
+        raise PackageError("local name differs")
+    if start + e.compress_size > len(b):
+        raise PackageError("entry runs past the end")
+    raw = b[start : start + e.compress_size]
+    if e.method == 0:
+        if e.compress_size != e.file_size:
+            raise PackageError("stored sizes differ")
+        data = raw
+    else:
+        inflater = zlib.decompressobj(-15)
+        try:
+            data = inflater.decompress(raw, e.file_size + 1)
+        except zlib.error:
+            raise PackageError("bad deflate data") from None
+        if not inflater.eof or len(data) != e.file_size:
+            raise PackageError("deflate data does not give the declared size")
+    if zlib.crc32(data) != e.crc:
+        raise PackageError("bad checksum")
+    return data

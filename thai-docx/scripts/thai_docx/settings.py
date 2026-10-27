@@ -1,0 +1,500 @@
+# SPDX-FileCopyrightText: 2026 Sayam Sriphua
+# SPDX-License-Identifier: MIT
+"""The settings of a build, in one registry (ADR 0028).
+
+Every setting is one entry: its flag, its kind, its default, the layer it belongs to, how
+a value is read and what the refusal says, what it needs, and the name the build reports
+it under. The defaults, the usage line, the parser, the reported settings and the flags a
+profile may hold are all derived from the entries; `js/45-settings.js` holds the same
+entries, and a test holds the two equal.
+
+Kinds: `value` takes a value; `option` takes one or is left out (None, or False for the
+page numbers); `list` takes numbers separated by commas; `switch` turns a setting on;
+`off` turns a setting that is on by default off.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+
+from . import markdown as md
+from .check import FONT_MAX, FONT_SPACES, quoted, spaces_named
+
+PAPER = {"a4": (11906, 16838), "letter": (12240, 15840), "f14": (12240, 18720)}  # f14: 8.5 x 13 in, folio
+PAGE_NUMBERS = ("top-right", "top-center", "bottom-center")  # the first is --page-numbers with no position
+# page numbers before the chapters, and appendix numbers: flag value → Word's number format
+FRONT_NUMBERS = {"thai-letters": "thaiLetters", "lower-roman": "lowerRoman", "upper-roman": "upperRoman", "decimal": "decimal"}
+APPENDIX_NUMBERS = {"thai-letters": "thaiLetters", "upper-letters": "upperLetter", "decimal": "decimal", "upper-roman": "upperRoman"}
+MIN_TEXT_TWIPS = 1440
+# the narrowest box --caption-matches-object gives a caption: 3 inches, or the text width
+MIN_CAPTION_TWIPS = 4320
+# layers (ADR 0028): 1 page and type, 2 page furniture, 3 tables, 4 headings, 5 thesis structure
+LAYERS = {1: "page and type", 2: "page furniture", 3: "tables", 4: "headings", 5: "thesis structure"}
+# what a document may hold that a setting needs (ADR 0028): the name a registry entry says in
+# `needs` or `clashes` → (the thing, as the settings reference names it; why the flag did nothing)
+STRUCTURES = {
+    "tables": ("a table", "the document has no table"),
+    "table captions": ("a `Table:` caption", "the document has no 'Table:' caption"),
+    "figure captions": ("a `Figure:` caption", "the document has no 'Figure:' caption"),
+    "captions": ("a `Table:` or `Figure:` caption", "the document has no 'Table:' or 'Figure:' caption"),
+    "images": ("an image on a line of its own", "the document has no image on a line of its own"),
+    "chapters or appendices": ("a `<!-- chapters -->` or `<!-- appendices -->` comment",
+                               "the document has no <!-- chapters --> or <!-- appendices --> comment"),
+    "chapter headings": ("a `#` heading under `<!-- chapters -->`",
+                         "no heading carries a chapter number; a # heading under <!-- chapters --> does"),
+    "numbered headings": ("a `#` heading under `<!-- chapters -->` or `<!-- appendices -->`",
+                          "no heading carries a chapter or appendix number; a # heading under <!-- chapters --> or <!-- appendices --> does"),
+    "appendices": ("an `<!-- appendices -->` comment", "the document has no <!-- appendices --> comment"),
+    "appendix headings": ("a `#` heading under `<!-- appendices -->`",
+                          "no heading carries an appendix letter; a # heading under <!-- appendices --> does"),
+    "front": ("a `<!-- front -->` comment", "the document has no <!-- front --> comment"),
+    "numbers": ("a numbered heading, an ordered list or a caption",
+                "the document has no numbered heading, ordered list or caption"),
+    "body paragraphs": ("a paragraph of body text",
+                        "the document has no body paragraph; a heading, list, quotation, table, code, caption"
+                        " or picture alone in its paragraph takes no first-line indent"),
+    "other text": ("a run that is not Thai (a number, a Latin word, a footnote's mark)",
+                   "every run is Thai text, and is marked complex script already"),
+}
+# (what the document places, as the reference names it; what the flag then does; the warning)
+CLASHES = {
+    "toc comment": ("a `<!-- toc -->` comment", "makes a second table of contents",
+                    "the document places a table of contents with <!-- toc --> as well, so it now has two"),
+}
+
+# read: ("text", most characters, characters refused besides the forbidden ones)
+#       ("points", least, most) — a whole number stays an integer
+#       ("number", least or None, most or None) — always a float
+#       ("numbers", how many) — floats, comma-separated
+#       ("choice", values) and ("position", values) — the second may be left out
+# report: (the name in the build's "settings", "value" | "float" | "sides")
+# needs: a setting that must be on too (refused without it), or a structure in STRUCTURES (the
+#        build warns that the flag changed nothing when the document lacks it)
+# clashes: a structure in CLASHES the setting duplicates (the build warns)
+# doc: (the setting, its default, the flag with an example) — the row of references/settings.md
+SETTINGS: tuple[dict, ...] = (
+    {"key": "font", "flag": "--font", "kind": "value", "default": "TH Sarabun New", "layer": 1,
+     "read": ("text", 64, ""), "takes": "a font name of 1 to 64 characters", "usage": "NAME",
+     "report": ("font", "value"),
+     "doc": ("font", "TH Sarabun New", '`--font "Sarabun"`')},
+    {"key": "size", "flag": "--size", "kind": "value", "default": 16, "layer": 1,
+     "read": ("points", 1, 400), "takes": "a number of points from 1 to 400", "usage": "PT",
+     "report": ("size_pt", "value"),
+     "doc": ("size", "16 pt", "`--size 14` (1–400)")},
+    {"key": "paper", "flag": "--paper", "kind": "value", "default": "a4", "layer": 1,
+     "read": ("choice", tuple(PAPER)), "takes": "a4, letter or f14",
+     "report": ("paper", "value"),
+     "doc": ("paper", "A4", "`--paper letter` or `--paper f14` (8.5 × 13 in)")},
+    {"key": "landscape", "flag": "--landscape", "kind": "switch", "default": False, "layer": 1,
+     "report": ("landscape", "value"),
+     "doc": ("orientation", "portrait", "`--landscape` (margins stay top, right, bottom, left)")},
+    {"key": "margins", "flag": "--margins", "kind": "list", "default": (1.0, 1.0, 1.0, 1.5), "layer": 1,  # top, right, bottom, left — inches
+     "read": ("numbers", 4), "takes": "four non-negative numbers: top,right,bottom,left", "usage": "T,R,B,L",
+     "report": ("margins_in", "sides"),
+     "doc": ("margins, inches", "1, 1, 1, 1.5 (top, right, bottom, left)", "`--margins 1,1,1,1`")},
+    {"key": "indent", "flag": "--indent", "kind": "value", "default": 0.0, "layer": 1,  # first line of body paragraphs — inches
+     "read": ("number", None, None), "takes": "a non-negative number of inches", "usage": "IN",
+     "needs": "body paragraphs",
+     "report": ("first_line_indent_in", "float"),
+     "doc": ("first-line indent, inches", "none", "`--indent 0.5` (body paragraphs only; not a picture alone in its paragraph)")},
+    {"key": "line_spacing", "flag": "--line-spacing", "kind": "value", "default": 1.0, "layer": 1,  # code and footnotes stay single
+     "read": ("number", 1, 3), "takes": "a multiple of single spacing from 1 to 3", "usage": "N",
+     "report": ("line_spacing", "float"),
+     "doc": ("line spacing", "1", "`--line-spacing 1.5` (1–3; code and footnotes stay single)")},
+    {"key": "align", "flag": "--align", "kind": "value", "default": "left", "layer": 1,
+     "read": ("choice", ("left", "thai")), "takes": "left or thai",
+     "report": ("align", "value"),
+     "doc": ("alignment", "left", "`--align thai` (Thai distributed, body paragraphs only; a table cell or a boxed caption "
+            "is justified at the spaces between words; a paragraph with no Thai stays left)")},
+    {"key": "toc", "flag": "--toc", "kind": "switch", "default": False, "layer": 4,
+     "clashes": "toc comment",
+     "report": ("toc", "value"),
+     "doc": ("table of contents", "none", "`--toc` (at the top of the document)")},
+    {"key": "heading_numbers", "flag": "--heading-numbers", "kind": "switch", "default": False, "layer": 4,  # 1. / 1.1 / 1.1.1
+     "report": ("heading_numbers", "value"),
+     "doc": ("heading numbers", "none", "`--heading-numbers` (1. for `#`, 1.1 for `##`, 1.1.1 …;"
+                                        " under region comments, the `##` and lower headings of chapters and appendices)")},
+    {"key": "page_numbers", "flag": "--page-numbers", "kind": "option", "default": False, "layer": 2,  # or one of PAGE_NUMBERS
+     "read": ("position", PAGE_NUMBERS), "takes": "top-right, top-center or bottom-center",
+     "report": ("page_numbers", "value"),
+     "doc": ("page numbers", "none", "`--page-numbers` (top right), `--page-numbers top-center` or `--page-numbers bottom-center`")},
+    {"key": "page_number_on_first", "flag": "--no-page-number-first", "kind": "off", "default": True, "layer": 2,
+     "needs": "page_numbers",
+     "report": ("page_number_on_first", "value"),
+     "doc": ("page number on the first page of each section", "shown", "`--no-page-number-first` (with `--page-numbers`)")},
+    {"key": "header", "flag": "--header", "kind": "option", "default": None, "layer": 2,  # centred at the top of every page
+     "read": ("text", 200, "\t\n"), "takes": "text of 1 to 200 characters on one line", "usage": "TEXT",
+     "report": ("header", "value"),
+     "doc": ("header text", "none", '`--header "ลับ"` (centred, above a page number there)')},
+    {"key": "footer", "flag": "--footer", "kind": "option", "default": None, "layer": 2,  # centred at the bottom of every page
+     "read": ("text", 200, "\t\n"), "takes": "text of 1 to 200 characters on one line", "usage": "TEXT",
+     "report": ("footer", "value"),
+     "doc": ("footer text", "none", '`--footer "TEXT"` (centred, above a page number there)')},
+    {"key": "thai_language", "flag": "--thai-language", "kind": "switch", "default": False, "layer": 1,
+     "report": ("thai_language", "value"),
+     "doc": ("the complex-script language of the text", "left to the reader's machine",
+             "`--thai-language` (writes `w:bidi=\"th-TH\"`; see [limits.md](limits.md) §3)")},
+    {"key": "force_cs_whole_doc", "flag": "--force-cs-whole-doc", "kind": "switch", "default": False, "layer": 1,  # ADR 0039
+     "needs": "other text",
+     "report": ("force_cs_whole_doc", "value"),
+     "doc": ("which runs are marked complex script", "the runs whose text is complex script",
+             '`--force-cs-whole-doc` (every run, as releases before 0.2.0 wrote: one font throughout, '
+             "and an application underlines correctly spelled English on screen)")},
+    {"key": "thai_digits", "flag": "--thai-digits", "kind": "switch", "default": False, "layer": 2,  # numbers Word generates; never the text
+     "report": ("thai_digits", "value"),
+     "doc": ("page, heading, list, caption and footnote numbers", "1 2 3", "`--thai-digits` (๑ ๒ ๓; the text itself is never changed)")},
+    {"key": "auto_numbering", "flag": "--auto-numbering", "kind": "switch", "default": False, "layer": 2,  # who counts: the build, or the application
+     "needs": "numbers",
+     "report": ("auto_numbering", "value"),
+     "doc": ("heading, list and caption numbers", "written by the build, the same in every application",
+             "`--auto-numbering` (the application counts, and Word renumbers as you edit; "
+             "what each application draws is in [numbering.md](numbering.md))")},
+    {"key": "hide_spelling_errors", "flag": "--hide-spelling-errors", "kind": "switch", "default": False, "layer": 1,
+     "report": ("hide_spelling_errors", "value"),
+     "doc": ("spelling squiggles", "shown", "`--hide-spelling-errors`")},
+    {"key": "repeat_table_header", "flag": "--no-repeat-table-header", "kind": "off", "default": True, "layer": 3,
+     "needs": "tables",
+     "report": ("repeat_table_header", "value"),
+     "doc": ("table header row", "repeats on every page",
+                "`--no-repeat-table-header` (and is then no header row to a screen reader either: the file has one mark for both)")},
+    {"key": "table_widths", "flag": "--table-widths", "kind": "value", "default": "equal", "layer": 3,  # or by the longest text
+     "read": ("choice", ("equal", "auto")), "takes": "equal or auto",
+     "needs": "tables",
+     "report": ("table_widths", "value"),
+     "doc": ("table column widths", "equal", "`--table-widths auto` (wider for longer text)")},
+    {"key": "table_size", "flag": "--table-size", "kind": "option", "default": None, "layer": 3,  # None: the body size
+     "read": ("points", 1, 400), "takes": "a number of points from 1 to 400", "usage": "PT",
+     "report": ("table_size_pt", "value"),
+     "doc": ("table text size", "as the body", "`--table-size 14` (1–400)")},
+    {"key": "chapter_label", "flag": "--chapter-label", "kind": "value", "default": "บทที่", "layer": 5,
+     "read": ("text", 40, '\t\n%"\\'), "takes": 'text of 1 to 40 characters on one line, without %, " or \\', "usage": "TEXT",
+     "needs": "chapter headings",
+     "report": ("chapter_label", "value"),
+     "doc": ("chapter label", "บทที่", '`--chapter-label "บท"`')},
+    {"key": "table_label", "flag": "--table-label", "kind": "value", "default": "ตารางที่", "layer": 5,
+     "read": ("text", 40, '\t\n%"\\'), "takes": 'text of 1 to 40 characters on one line, without %, " or \\', "usage": "TEXT",
+     "needs": "table captions",
+     "report": ("table_label", "value"),
+     "doc": ("table caption label", "ตารางที่", '`--table-label "ตาราง"`')},
+    {"key": "figure_label", "flag": "--figure-label", "kind": "value", "default": "รูปที่", "layer": 5,
+     "read": ("text", 40, '\t\n%"\\'), "takes": 'text of 1 to 40 characters on one line, without %, " or \\', "usage": "TEXT",
+     "needs": "figure captions",
+     "report": ("figure_label", "value"),
+     "doc": ("figure caption label", "รูปที่", '`--figure-label "ภาพที่"`')},
+    {"key": "caption_hanging_indent", "flag": "--caption-hanging-indent", "kind": "value", "default": 0.0, "layer": 5,  # inches
+     "read": ("number", 0, 4), "takes": "a number of inches from 0 to 4", "usage": "IN",
+     "needs": "captions",
+     "report": ("caption_hanging_indent_in", "float"),
+     "doc": ("caption lines after the first", "start at the margin, like the first",
+             "`--caption-hanging-indent 0.75` (0–4 in; independent of `--indent`)")},
+    {"key": "center_images", "flag": "--center-images", "kind": "switch", "default": False, "layer": 5,
+     "needs": "images",
+     "report": ("center_images", "value"),
+     "doc": ("an image on a line of its own", "starts at the left margin", "`--center-images`")},
+    {"key": "caption_matches_object", "flag": "--caption-matches-object", "kind": "switch", "default": False, "layer": 5,
+     "needs": "figure captions",
+     "report": ("caption_matches_object", "value"),
+     "doc": ("the width of a caption", "the width of the text",
+             "`--caption-matches-object` (as wide as the picture it belongs to and never narrower than 3 in, "
+             "centred with the picture under `--center-images` and starting at the margin, where the picture "
+             "does, without it: under a picture narrower than 3 in the caption is wider than the picture; a hang "
+             "that leaves it less than an inch gives the caption the text width, and the build says so)")},
+    {"key": "front_page_numbers", "flag": "--front-page-numbers", "kind": "value", "default": "thai-letters", "layer": 5,
+     "read": ("choice", tuple(FRONT_NUMBERS)), "takes": ", ".join(FRONT_NUMBERS),
+     "needs": "front",
+     "report": ("front_page_numbers", "value"),
+     "doc": ("page numbers before the chapters", "ก ข ค", "`--front-page-numbers lower-roman` (or `upper-roman`, `decimal`)")},
+    {"key": "appendix_label", "flag": "--appendix-label", "kind": "value", "default": "ภาคผนวก", "layer": 5,
+     "read": ("text", 40, '\t\n%"\\'), "takes": 'text of 1 to 40 characters on one line, without %, " or \\', "usage": "TEXT",
+     "needs": "appendix headings",
+     "report": ("appendix_label", "value"),
+     "doc": ("appendix label", "ภาคผนวก", '`--appendix-label "Appendix"`')},
+    {"key": "appendix_numbers", "flag": "--appendix-numbers", "kind": "value", "default": "thai-letters", "layer": 5,
+     "read": ("choice", tuple(APPENDIX_NUMBERS)), "takes": ", ".join(APPENDIX_NUMBERS),
+     "needs": "appendix headings",
+     "report": ("appendix_numbers", "value"),
+     "doc": ("appendix numbers", "ก ข ค", "`--appendix-numbers upper-letters` (or `decimal`, `upper-roman`)")},
+    {"key": "chapter_title_on_new_line", "flag": "--chapter-title-on-new-line", "kind": "switch", "default": False, "layer": 5,
+     "needs": "numbered headings",
+     "report": ("chapter_title_on_new_line", "value"),
+     "doc": ("chapter title", "beside its number", "`--chapter-title-on-new-line` (บทที่ 1 on one line, the title under it)")},
+)
+
+DEFAULTS = {s["key"]: s["default"] for s in SETTINGS}
+BY_FLAG = {s["flag"]: s for s in SETTINGS}
+BY_KEY = {s["key"]: s for s in SETTINGS}
+USAGE = "usage: thai_docx build IN.md OUT.docx " + " ".join(
+    "[" + s["flag"]
+    + ("" if s["kind"] in ("switch", "off")
+       else " [" + "|".join(s["read"][1]) + "]" if s["read"][0] == "position"
+       else " " + "|".join(s["read"][1]) if s["read"][0] == "choice"
+       else " " + s["usage"])
+    + "]"
+    for s in SETTINGS
+) + " [--profile NAME|PATH [--default SETTING[,SETTING]]] [--allow-dir DIR]"
+NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")  # used with fullmatch: no "$" before a newline
+
+
+class BuildError(Exception):
+    def __init__(self, what: str):
+        super().__init__(what)
+        self.what = what
+
+
+def font_cut(name: str) -> str | None:
+    """The name the document writes, when it is not the name given; else None.
+    Windows and Word read 31 characters of it (check.py's FONT_MAX): the build writes what
+    Word reads, and says so, rather than a name that no font of Word's can carry. No font's
+    name begins or ends with a space, so a space there — typed, or left where the name was
+    cut — is not written: a name ending in one names no installed font."""
+    kept = name.strip(FONT_SPACES)
+    if len(kept) > FONT_MAX:
+        kept = kept[:FONT_MAX].rstrip(FONT_SPACES)
+    return kept if kept != name else None
+
+
+def font_cut_said(what: str, name: str, kept: str) -> str:
+    """The warning for a font's name the build changed: the name given, the name written, and
+    what the user gets from it — the font only when one is installed under the name written."""
+    # a space other than U+0020 is named where one was taken off (check.spaces_named says why)
+    named = spaces_named
+    ends = name[:len(name) - len(name.lstrip(FONT_SPACES))] + name[len(name.rstrip(FONT_SPACES)):]
+    inner = name.strip(FONT_SPACES)
+    if len(inner) <= FONT_MAX:
+        return (what + " '" + quoted(name) + "' begins or ends with a space" + named(ends)
+                + ", which no font's name does, so the document names '" + quoted(kept) + "'")
+    # the name given is shown as far as a font's name goes, like one check reads from a file: a
+    # sentence put in a profile's font does not reach the reader of the JSON whole (V31-04)
+    # the spaces taken off: at either end of the name given, and at the end of the 31 kept
+    cut = inner[:FONT_MAX]
+    off = named(ends + cut[len(cut.rstrip(FONT_SPACES)):])
+    return (what + " '" + quoted(name, FONT_MAX) + "' is longer than the " + str(FONT_MAX) + " characters Word reads of a"
+            " font's name, so the document names '" + quoted(kept) + "'"
+            + (", without a space" + off + " at either end" if off else "")
+            + ": Word uses a font only if one is installed under exactly that name, and shows another font if none is")
+
+
+def half_up(x: float) -> int:
+    return int(math.floor(x + 0.5))
+
+
+def page_size(opts: dict) -> tuple[int, int]:
+    """Width and height in twips; landscape turns the paper, the margins stay top, right, bottom, left."""
+    pw, ph = PAPER[opts["paper"]]
+    return (ph, pw) if opts["landscape"] else (pw, ph)
+
+
+def _read(s: dict, value: str):
+    """A value as the entry reads it, or BuildError with the entry's own words."""
+    how = s["read"]
+    refused = BuildError(s["flag"] + " takes " + s["takes"])
+    if how[0] == "text":
+        if not value or len(value) > how[1] or any(c in how[2] or md.forbidden_char(c) for c in value):
+            raise refused
+        if s["key"] == "font" and not value.strip(FONT_SPACES):  # spaces alone name no font
+            raise refused
+        return value
+    if how[0] in ("choice", "position"):
+        if value not in how[1]:
+            raise refused
+        return value
+    # a number too long for a float is infinite, and an infinite length is not one
+    if how[0] == "numbers":
+        vals = value.split(",")
+        if len(vals) != how[1] or not all(NUMBER.fullmatch(v) and math.isfinite(float(v)) for v in vals):
+            raise refused
+        return tuple(float(v) for v in vals)
+    if (not NUMBER.fullmatch(value) or not math.isfinite(float(value))
+            or (how[1] is not None and not how[1] <= float(value) <= how[2])):
+        raise refused
+    x = float(value)
+    return int(x) if how[0] == "points" and x == int(x) else x
+
+
+def read_value(flag: str, value: str):
+    """One flag's value, read as the build reads it — for a command that takes the flag
+    without the rest of the build's (repair's --font)."""
+    return _read(BY_FLAG[flag], value)
+
+
+def parse_args(argv: list[str]) -> tuple[dict, list[str], list[str]]:
+    """Flags → (opts, positionals, allow_dirs). Raises BuildError with a message
+    both implementations share; no abbreviations, `--flag value` or `--flag=value`."""
+    opts = dict(DEFAULTS)
+    positional: list[str] = []
+    allow: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if not arg.startswith("--"):
+            positional.append(arg)
+            i += 1
+            continue
+        name, eq, value = arg.partition("=")
+        if name == "--help":
+            raise BuildError(USAGE)
+        s = BY_FLAG.get(name)
+        if s is not None and s["kind"] == "option" and s["read"][0] == "position":
+            # the position is optional: taken only when it names one
+            if not eq and i + 1 < len(argv) and argv[i + 1] in s["read"][1]:
+                eq, value = "=", argv[i + 1]
+                i += 1
+            opts[s["key"]] = _read(s, value) if eq else s["read"][1][0]
+            i += 1
+            continue
+        if s is not None and s["kind"] in ("switch", "off"):
+            if eq:
+                raise BuildError(name + " takes no value")
+            opts[s["key"]] = s["kind"] == "switch"
+            i += 1
+            continue
+        if s is None and name != "--allow-dir":
+            raise BuildError("unknown option " + name)
+        if not eq:
+            if i + 1 >= len(argv):
+                raise BuildError(name + " needs a value")
+            value = argv[i + 1]
+            i += 1
+        i += 1
+        if s is None:
+            if not value:  # an empty directory is the working directory, which nobody named
+                raise BuildError("--allow-dir takes a directory; an empty one names none")
+            allow.append(value)
+        else:
+            opts[s["key"]] = _read(s, value)
+    if len(positional) != 2:
+        raise BuildError(USAGE)
+    kept = font_cut(opts["font"])
+    if kept is not None:  # said with the build's other settings warnings
+        opts["_font_given"], opts["font"] = opts["font"], kept
+    for s in SETTINGS:
+        needed = s.get("needs")
+        if needed in DEFAULTS and opts[s["key"]] != s["default"] and opts[needed] == DEFAULTS[needed]:
+            raise BuildError(s["flag"] + " needs " + BY_KEY[needed]["flag"])
+    # Word's SEQ field names its counter with one word, so a caption label written as one takes
+    # no space; numbers the build writes as text carry the label as text, where a space is fine
+    if opts["auto_numbering"]:
+        for key in ("table_label", "figure_label"):
+            if any(c in " \t\n\r\f\v\u00a0\u3000" for c in opts[key]):
+                raise BuildError(BY_KEY[key]["flag"] + " takes no space with --auto-numbering: Word's SEQ field names a counter with one word")
+    pw, ph = page_size(opts)
+    top, right, bottom, left = (half_up(m * 1440) for m in opts["margins"])
+    if pw - left - right < MIN_TEXT_TWIPS or ph - top - bottom < MIN_TEXT_TWIPS:
+        raise BuildError("--margins leave less than one inch for text")
+    if pw - left - right - half_up(opts["indent"] * 1440) < MIN_TEXT_TWIPS:
+        raise BuildError("--indent leaves less than one inch for text")
+    if pw - left - right - half_up(opts["caption_hanging_indent"] * 1440) < MIN_TEXT_TWIPS:
+        # every line of a caption after its first stands that far in: past the text, a line
+        # of negative width, which no application lays out as the user meant
+        raise BuildError("--caption-hanging-indent leaves less than one inch for text")
+    return opts, positional, allow
+
+
+def settings_json(opts: dict) -> dict:
+    """The settings as the build reports them, in registry order."""
+    out = {}
+    for s in SETTINGS:
+        name, form = s["report"]
+        value = opts[s["key"]]
+        if form == "float":
+            value = float(value)
+        elif form == "sides":
+            value = dict(zip(("top", "right", "bottom", "left"), (float(v) for v in value), strict=True))
+        out[name] = value
+    return out
+
+
+def _and(flags: list[str]) -> str:
+    return flags[0] if len(flags) == 1 else ", ".join(flags[:-1]) + " and " + flags[-1]
+
+
+def settings_warnings(opts: dict, present: set[str]) -> list[str]:
+    """A flag that changed nothing is said out loud, never dropped in silence: one warning
+    for each structure the document lacks, naming every flag given that needed it; then
+    one for each flag that duplicates what the document already places."""
+    missing: dict[str, list[str]] = {}
+    for s in SETTINGS:
+        need = s.get("needs")
+        if need in STRUCTURES and need not in present and opts[s["key"]] != s["default"] and s["key"] not in opts.get("_quiet", ()):
+            missing.setdefault(need, []).append(s["flag"])
+    out = [_and(flags) + " changed nothing: " + STRUCTURES[need][1] for need, flags in missing.items()]
+    # a profile's font is said too: it is not a setting that reached nothing, but a name changed
+    if "_font_given" in opts:
+        out.append(font_cut_said("--font", opts["_font_given"], opts["font"]))
+    # --thai-language names the language in the styles whatever the text is, so it changed bytes
+    # and is not a flag that "changed nothing"; with no Thai text it still reached no run. A
+    # profile's settings in _quiet are not said: the user did not ask for them this time (B-15)
+    quiet = opts.get("_quiet", ())
+    if opts["thai_language"] and "thai_language" not in quiet and "thai text" not in present:
+        out.append("--thai-language reached no run: the document has no Thai text, and only the styles name the language")
+    # --toc writes its field whatever the document holds, so it too changed bytes; with no heading
+    # the field lists nothing, and an application updating it may write that it found none
+    if opts["toc"] and "headings" not in present:
+        out.append("--toc has no heading to list: the document has none, so the table of contents is empty")
+    # three more write bytes that nothing may use — --auto-numbering's heading levels, a page-number
+    # format, a style — so they too "reached no" rather than "changed nothing"; a profile's are
+    # not said, as above
+    if opts["heading_numbers"] and "heading_numbers" not in quiet and "headings it numbers" not in present:
+        out.append("--heading-numbers reached no heading: " + (
+            "the document has none" if "headings" not in present else
+            "in a document with region comments it numbers the ## and lower headings under"
+            " <!-- chapters --> or <!-- appendices -->, and there are none"))
+    if opts["thai_digits"] and "thai_digits" not in quiet and "numbers shown" not in present:
+        out.append("--thai-digits reached no number: the document has no page, heading, list, caption or footnote"
+                   " number, and only the page-number format names Thai digits")
+    if opts["table_size"] is not None and "table_size" not in quiet and "tables" not in present:
+        out.append("--table-size reached no table: the document has none, and only the Table Text style carries the size")
+    for s in SETTINGS:
+        clash = s.get("clashes")
+        if clash in present and opts[s["key"]] != s["default"]:
+            out.append(s["flag"] + ": " + CLASHES[clash][2])
+    return out
+
+
+# --- the interview (ADR 0029) ----------------------------------------------------------------
+
+# The nine questions of grill mode, in order. A choice sets settings (`set`), or takes a value
+# the user types (`other`: the setting and the placeholder its flag shows), or says where the
+# answers are kept (`save`). Labels are (Thai, English).
+QUESTIONS: tuple[dict, ...] = (
+    {"key": "font", "text": ("ฟอนต์", "Font"), "choices": (
+        {"set": {"font": "TH Sarabun New"}, "label": ("TH Sarabun New", "TH Sarabun New")},
+        {"set": {"font": "TH SarabunPSK"}, "label": ("TH SarabunPSK", "TH SarabunPSK")},
+        {"set": {"font": "Sarabun"}, "label": ("Sarabun", "Sarabun")},
+        {"other": {"font": "NAME"}, "label": ("อื่น ๆ: พิมพ์ชื่อฟอนต์", "Other: the font name")})},
+    {"key": "size", "text": ("ขนาดตัวอักษร", "Font size"), "choices": (
+        {"set": {"size": 16}, "label": ("16 pt", "16 pt")},
+        {"set": {"size": 14}, "label": ("14 pt", "14 pt")},
+        {"set": {"size": 15}, "label": ("15 pt", "15 pt")},
+        {"other": {"size": "N"}, "label": ("อื่น ๆ: พิมพ์ขนาด", "Other: the size")})},
+    {"key": "paper", "text": ("กระดาษและขอบ", "Paper and margins"), "choices": (
+        {"set": {"paper": "a4", "margins": (1.0, 1.0, 1.0, 1.5)},
+         "label": ("A4 ขอบซ้าย 1.5 นิ้ว ด้านอื่น 1 นิ้ว", "A4, left 1.5 in, others 1 in")},
+        {"set": {"paper": "a4", "margins": (1.0, 1.0, 1.0, 1.0)}, "label": ("A4 ขอบ 1 นิ้วทุกด้าน", "A4, 1 in all round")},
+        {"set": {"paper": "letter", "margins": (1.0, 1.0, 1.0, 1.5)},
+         "label": ("Letter ขอบซ้าย 1.5 นิ้ว ด้านอื่น 1 นิ้ว", "Letter, left 1.5 in, others 1 in")},
+        {"other": {"paper": "PAPER", "margins": "T,R,B,L"},
+         "label": ("อื่น ๆ: กระดาษ และขอบ บน ขวา ล่าง ซ้าย เป็นนิ้ว", "Other: paper, and margins top, right, bottom, left in inches")})},
+    {"key": "align", "text": ("การจัดย่อหน้า", "Paragraph alignment"), "choices": (
+        {"set": {"align": "left"}, "label": ("ชิดซ้าย", "Left")},
+        {"set": {"align": "thai"}, "label": ("กระจายแบบไทย", "Thai distributed")})},
+    {"key": "indent", "text": ("ย่อหน้าบรรทัดแรกของเนื้อความ", "First-line indent of body paragraphs"), "choices": (
+        {"set": {"indent": 0.0}, "label": ("ไม่ย่อ", "None")},
+        {"set": {"indent": 0.5}, "label": ("0.5 นิ้ว", "0.5 in")},
+        {"set": {"indent": 1.0}, "label": ("1 นิ้ว", "1 in")},
+        {"other": {"indent": "N"}, "label": ("อื่น ๆ: พิมพ์เป็นนิ้ว", "Other: inches")})},
+    {"key": "toc", "text": ("สารบัญ", "Table of contents"), "choices": (
+        {"set": {"toc": False}, "label": ("ไม่ใส่", "No")},
+        {"set": {"toc": True}, "label": ("ใส่", "Yes")})},
+    {"key": "page-numbers", "text": ("เลขหน้า", "Page numbers"), "choices": (
+        {"set": {"page_numbers": False}, "label": ("ไม่ใส่", "No")},
+        {"set": {"page_numbers": "top-right"}, "label": ("ใส่", "Yes")})},
+    {"key": "squiggles", "text": ("เส้นหยักตรวจคำสะกด", "Spelling squiggles"), "choices": (
+        {"set": {"hide_spelling_errors": False}, "label": ("แสดง", "Show")},
+        {"set": {"hide_spelling_errors": True}, "label": ("ซ่อน (ซ่อนคำที่สะกดผิดจริงด้วย)", "Hide (hides real typos too)")})},
+    {"key": "save", "text": ("บันทึกการตั้งค่านี้ไว้ใช้ครั้งต่อไป", "Keep these settings for next time"), "choices": (
+        {"save": None, "label": ("ไม่บันทึก", "No")},
+        {"save": "home", "label": ("บันทึกเป็นของฉัน: พิมพ์ชื่อ", "Yes, as mine: the name")},
+        {"save": "project", "label": ("บันทึกไว้ในโปรเจกต์นี้: พิมพ์ชื่อ", "Yes, in this project: the name")})},
+)

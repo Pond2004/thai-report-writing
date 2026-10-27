@@ -1,0 +1,25 @@
+{
+  "id": "thesis",
+  "schema": 1,
+  "title": {
+    "th": "วิทยานิพนธ์ (ตัวอย่าง)",
+    "en": "Thesis (example)"
+  },
+  "description": {
+    "th": "ตัวอย่างโปรไฟล์ที่ซับซ้อนที่สุด มีค่ามากกว่าที่คำถาม grill ถามถึง — แก้ได้ทุกค่า",
+    "en": "The most complex example profile, with more than the interview asks about — change any of it"
+  },
+  "source": "https://github.com/sayam/thai-docx-skill",
+  "settings": {
+    "align": "thai",
+    "caption_matches_object": true,
+    "center_images": true,
+    "chapter_title_on_new_line": true,
+    "heading_numbers": true,
+    "indent": 0.5,
+    "line_spacing": 1.5,
+    "page_number_on_first": false,
+    "page_numbers": "top-right",
+    "thai_digits": true
+  }
+}
